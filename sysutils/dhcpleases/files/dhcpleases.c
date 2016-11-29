@@ -38,7 +38,7 @@
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-/* Code in this file is based on contributions by John Volpe. */
+/* Code in this file is based on contributions by John Volpe and C. R. Oldham. */
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -82,6 +82,7 @@ static char *domain_suffix = NULL;
 static int hostssize = 0;
 static int foreground = 0;
 static int unbound = 0;
+static int no_host_entries_in_leases = 0;
 static char *unbound_conf = NULL;
 
 static int fexist(char *);
@@ -250,7 +251,7 @@ convert_time(struct tm lease_time) {
 }
 
 static int
-load_dhcp(FILE *fp, char *leasefile, char *domain_sufix, time_t now) {
+load_dhcp(FILE *fp, char *leasefile, char *domain_suffix, time_t now) {
 	char namebuff[256];
 	char *hostname = namebuff, *suffix = NULL;
 	char token[MAXTOK], *dot;
@@ -357,7 +358,102 @@ load_dhcp(FILE *fp, char *leasefile, char *domain_sufix, time_t now) {
 				}
 
 				if (foreground)
-					printf("Found hostname: %s.%s\n", hostname, suffix);
+					printf("Found dhcp hostname: %s.%s\n", hostname, suffix);
+
+				if (asprintf(&lease->name, "%s", hostname) < 0) {
+					LIST_REMOVE(lease, next);
+					if (lease->name != NULL)
+						free(lease->name);
+					if (lease->fqdn != NULL)
+						free(lease->fqdn);
+					free(lease);
+				}
+				if (asprintf(&lease->fqdn, "%s.%s", hostname, suffix) < 0) {
+					LIST_REMOVE(lease, next);
+					if (lease->name != NULL)
+						free(lease->name);
+					if (lease->fqdn != NULL)
+						free(lease->fqdn);
+					free(lease);
+				}
+			}
+		}
+		if (no_host_entries_in_leases && strcmp(token, "host") == 0) {
+			*hostname = 0;
+			ttd = tts = (time_t)(-1);
+      if (next_token(hostname, MAXDNAME, fp)) {
+        if (*hostname == '}') {
+          *hostname = 0;
+        } else if (!canonicalise(hostname)) {
+          if (foreground)
+            printf("bad name(%s) in %s\n", hostname, leasefile);
+          else
+            syslog(LOG_ERR, "bad name in %s", leasefile);
+          *hostname = 0;
+        } else {
+          while (next_token(token, MAXTOK, fp) && strcmp(token, "}") != 0) {
+            if (strcmp(token, "fixed-address") == 0) {
+              if (next_token(token, MAXTOK, fp) &&
+                  (!inet_pton(AF_INET, token, &host_address))) {
+                    /* Bad IP address */
+                    *hostname = 0;
+                    if (strcmp(token, "}") == 0) {
+                      break;
+                    }
+                    continue;
+              }
+            }
+          }
+				}
+
+				/* missing info? */
+				if (!*hostname)
+					continue;
+
+				/* We use 0 as infinite in ttd */
+        ttd = tts = (time_t)0;
+				/* if ((tts != -1) && (ttd == tts - 1))
+           ttd = (time_t)0; */
+
+				if ((dot = strchr(hostname, '.'))) {
+					if (!domain_suffix || hostname_isequal(dot+1, domain_suffix)) {
+						if (foreground)
+							printf("Other suffix in DHCP lease for %s", hostname);
+						else
+							syslog(LOG_WARNING, "Other suffix in DHCP lease for %s", hostname);
+
+						suffix = (dot + 1);
+						*dot = 0;
+					} else
+						suffix = domain_suffix;
+				} else
+					suffix = domain_suffix;
+
+				LIST_FOREACH(lease, &leases, next) {
+					if (hostname_isequal(lease->name, hostname)) {
+						lease->expires = ttd;
+						lease->addr = host_address;
+						break;
+					}
+				}
+
+				if (!lease) {
+					if ((lease = malloc(sizeof(struct isc_lease))) == NULL)
+						continue;
+					lease->expires = ttd;
+					lease->addr = host_address;
+					lease->fqdn = NULL;
+					lease->name = NULL;
+					LIST_INSERT_HEAD(&leases, lease, next);
+				} else {
+					if (lease->fqdn != NULL)
+						free(lease->fqdn);
+					if (lease->name != NULL)
+						free(lease->name);
+				}
+
+				if (foreground)
+					printf("Found static hostname: %s.%s\n", hostname, suffix);
 
 				if (asprintf(&lease->name, "%s", hostname) < 0) {
 					LIST_REMOVE(lease, next);
@@ -380,6 +476,7 @@ load_dhcp(FILE *fp, char *leasefile, char *domain_sufix, time_t now) {
 	}
 
 	/* prune expired leases */
+  /*
 	LIST_FOREACH_SAFE(lease, &leases, next, tmp) {
 		if (lease->expires != (time_t)0 && difftime(now, lease->expires) > 0) {
 			if (lease->name)
@@ -390,6 +487,7 @@ load_dhcp(FILE *fp, char *leasefile, char *domain_sufix, time_t now) {
 			free(lease);
 		}
 	}
+  */
 
 	return (0);
 }
@@ -401,7 +499,7 @@ write_status() {
 	size_t tmpsize;
 	int fd;
 
-	fd = open(HOSTS, O_RDWR | O_CREAT | O_FSYNC);
+	fd = open(HOSTS, O_RDWR | O_CREAT | O_FSYNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH );
 	if (fd < 0)
 		return 1;
 	if (fstat(fd, &tmp) < 0)
@@ -443,7 +541,7 @@ write_unbound_conf() {
 	struct isc_lease *lease;
 	int fd;
 
-	fd = open(unbound_conf, O_WRONLY | O_TRUNC | O_CREAT | O_FSYNC);
+	fd = open(unbound_conf, O_WRONLY | O_TRUNC | O_CREAT | O_FSYNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH );
 	if (fd < 0)
 		return 1;
 
@@ -471,7 +569,7 @@ truncate_hosts()
 	size_t tmpsize;
 	struct stat tmp;
 
-	fd = open(HOSTS, O_RDWR | O_CREAT | O_FSYNC);
+	fd = open(HOSTS, O_RDWR | O_CREAT | O_FSYNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	if (fd < 0)
 		return;
 	if (fstat(fd, &tmp) < 0)
@@ -575,9 +673,36 @@ handle_signal(int sig) {
 	}
 }
 
+void
+usage() {
+      printf("Usage: dhcpleases [-H] [-c] [-p pid filename for unbound] [-f]\n");
+      printf("                  [-d domain suffix] [-h unbound hosts filename]\n");
+      printf("                  -l dhcpleases_filename [-s]\n");
+      printf("                  [-u unbound config filename]\n");
+      printf("       -H:          Help and description.\n");
+      printf("       -c:          Execute this command with 'system()'\n");
+      printf("       -d suffix:   Domain suffix to append to DNS entries.\n");
+      printf("       -p filename: Use this file for the PID for the unbound dhcp server\n");
+      printf("       -f:          Run in foreground; do not daemonize.  NOTE dhcpleases does not write unbound's \n"
+             "                    hosts or configuration files when running in the foreground.\n");
+      printf("       -h filename: Update this file with hosts information.\n");
+      printf("       -l filename: (required) Read this file for dhcp lease information and translate those leases\n"
+             "                    into unbound DNS records.  This file must exist.\n");
+      printf("       -s:          Do NOT include static hosts entries from the leases file.\n");
+      printf("       -u filename: Unbound configuration file.\n");
+}
+
+void
+help_and_description() {
+      printf("\ndhcpleases watches the ISC DHCP daemon's leases file and copies entries from there\n"
+             "to a standard BIND format hosts file (like /etc/hosts) as well as to an Unbound-format\n"
+             "configuration file.  This enables IP addresses and hostnames handed out by the DHCP daemon\n" 
+             "to appear in DNS.\n");
+}
+
 int
 main(int argc, char **argv) {
-	char *command, *domain_sufix, *leasefile, *pidfile;
+	char *command, *domain_suffix, *leasefile, *pidfile;
 	FILE *fp;
 	struct kevent evlist;    /* events we want to monitor */
 	struct kevent chlist;    /* events that were triggered */
@@ -586,11 +711,15 @@ main(int argc, char **argv) {
 	int kq, nev, leasefd, pidf, ch;
 
 	command = NULL;
-	domain_sufix = NULL;
+	domain_suffix = NULL;
 	leasefile = NULL;
 	pidfile = NULL;
-	while ((ch = getopt(argc, argv, "c:d:fp:h:l:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "Hc:d:fp:h:l:u:")) != -1) {
 		switch (ch) {
+    case 'H':
+      usage();
+      help_and_description();
+      exit(-1);
 		case 'c':
 			command = optarg;
 			break;
@@ -609,12 +738,15 @@ main(int argc, char **argv) {
 		case 'l':
 			leasefile = optarg;
 			break;
+		case 's':
+			no_host_entries_in_leases = 1;
+			break;
 		case 'u':
 			unbound_conf = optarg;
 			unbound = 1;
 			break;
 		default:
-			printf("Wrong number of arguments given.\n"); /* XXX: usage */
+      usage();
 			exit(2);
 			/* NOTREACHED */
 		}
@@ -623,57 +755,60 @@ main(int argc, char **argv) {
 	argv += optind;
 
 	if (leasefile == NULL) {
-		syslog(LOG_ERR, "lease file is mandatory as parameter");
-		printf("lease file is mandatory as parameter\n");
+		syslog(LOG_ERR, "Lease filename is a required parameter. Exiting.");
+		printf("dhcpleases: Lease filename is a required parameter (-l leasefilename). Exiting.\n");
+    usage();
 		exit(1);
 	}
 	if (!fexist(leasefile)) {
-		syslog(LOG_ERR, "lease file needs to exist before starting dhcpleases");
-		printf("lease file needs to exist before starting dhcpleases\n");
+		syslog(LOG_ERR, "Lease file must exist before starting dhcpleases. Exiting.");
+		printf("dhcpleases: Lease file must exist when starting dhcpleases. Exiting.\n");
 		exit(1);
 	}
 	if (domain_suffix == NULL) {
-		syslog(LOG_ERR, "a domain suffix is not passed as argument using 'local' as suffix");
+		syslog(LOG_ERR, "No domain suffix passed via '-d', using default of 'local'.");
+		printf("dhcpleases: No domain suffix passed via '-d', using default of 'local'.\n");
 		domain_suffix = "local";
 	}
 
 	if (pidfile == NULL && !foreground) {
-		syslog(LOG_ERR, "pidfile argument not passed it is mandatory");
-		printf("pidfile argument not passed it is mandatory\n");
+		syslog(LOG_ERR, "PID filename for unbound's PID (-f) is required.  Exiting.");
+		printf("dhcpleases: PID filename for unbound's PID (-f) is required. Exiting.");
 		exit(1);
 	}
 
 	if (!foreground) {
 		if (HOSTS == NULL) {
-			syslog(LOG_ERR, "You need to specify the hosts file path.");
-			printf("You need to specify the hosts file path.\n");
+			syslog(LOG_ERR, "Path for unbound's 'hosts' file (-h) is a required parameter. Exiting.");
+			printf("dhcpleases: Path for unbound's 'hosts' file (-h) is a required parameter. Exiting.\n");
 			exit(8);
 		}
 		if (!fexist(HOSTS)) {
-			syslog(LOG_ERR, "Hosts file %s does not exist!", HOSTS);
-			printf("Hosts file passed as parameter does not exist.\n");
+			syslog(LOG_ERR, "Requested file for unbound's hosts (%s) does not exist. Exiting.", HOSTS);
+			printf("dhcpleases: Requested file for unbound's hosts (%s) does not exist. Exiting.\n", HOSTS);
 			exit(8);
 		}
 
 		if ((hostssize = fsize(HOSTS)) < 0) {
-			syslog(LOG_ERR, "Error while getting %s file size.", HOSTS);
-			printf("Error while getting /etc/hosts file size.\n");
+			syslog(LOG_ERR, "Could not get size of unbound's hosts file (%s). Exiting: %m", HOSTS);
+			printf("dhcpleases: Could not get size of unbound's hosts file (%s). Exiting.\n", HOSTS);
 			exit(6);
 		}
 
 		closelog();
 		closefrom(3);
 
-		if (daemon(0, 0) < 0) {
-			perror("Could not daemonize");
-			syslog(LOG_ERR, "Could not daemonize");
+    if (daemon(0, 0) < 0) {
+			perror("dhcpleases: Could not daemonize. Exiting.");
+			syslog(LOG_ERR, "Could not daemonize. Exiting: %m");
 			exit(4);
 		}
 
-		pidf = open(PIDFILE, O_RDWR | O_CREAT | O_FSYNC);
-		if (pidf < 0)
-			syslog(LOG_ERR, "could not write pid file, %m");
-		else {
+		pidf = open(PIDFILE, O_RDWR | O_CREAT | O_FSYNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+		if (pidf < 0) {
+			perror("dhcpleases: Unable to write PID file for dhcpleases.");
+			syslog(LOG_ERR, "Unable to write PID file for dhcpleases: %m");
+		} else {
 			ftruncate(pidf, 0);
 			dprintf(pidf, "%u\n", getpid());
 			close(pidf);
@@ -686,37 +821,39 @@ main(int argc, char **argv) {
 		sa.sa_flags = SA_SIGINFO|SA_RESTART;
 		sigemptyset(&sa.sa_mask);
 		if (sigaction(SIGHUP, &sa, NULL) < 0) {
-			syslog(LOG_ERR, "unable to set signal handler, %m");
+			syslog(LOG_ERR, "Unable to set SIGHUP handler. Exiting: %m");
 			exit(9);
 		}
 		if (sigaction(SIGTERM, &sa, NULL) < 0) {
-			syslog(LOG_ERR, "unable to set signal handler, %m");
+			syslog(LOG_ERR, "Unable to set SIGTERM handler. Exiting: %m");
 			exit(10);
 		}
 
 		/* Create a new kernel event queue */
 		if ((kq = kqueue()) == -1)
+			perror("dhcpleases: Unable to create new kernel event queue.  Exiting.");
+			syslog(LOG_ERR, "Unable to create new kernel event queue.  Exiting: %m");
 			exit(1);
 	}
 
 reopen:
 	leasefd = open(leasefile, O_RDONLY);
 	if (leasefd < 0) {
-		perror("Could not get descriptor");
-		syslog(LOG_ERR, "Could not get descriptor");
+		perror("dhcpleases: Unable to get a file descriptor for the dhcp leases file. Exiting.");
+		syslog(LOG_ERR, "Unable to get a file descriptor for the dhcp leases file. Exiting: %m");
 		exit(6);
 	}
 
 	fp = fdopen(leasefd, "r");
 	if (fp == NULL) {
-		perror("could not open leases file");
-		syslog(LOG_ERR, "could not open leases file");
+		perror("dhcpleases: Unable to open the dhcp leases file. Exiting.");
+		syslog(LOG_ERR, "Unable to open the dhcp leases file.  Exiting: %m");
 		exit(5);
 	}
 
 	now = time(NULL);
 	if (command == NULL) {
-		load_dhcp(fp, leasefile, domain_sufix, now);
+		load_dhcp(fp, leasefile, domain_suffix, now);
 
 		write_status();
 		//syslog(LOG_INFO, "written temp hosts file after modification event.");
@@ -736,7 +873,7 @@ reopen:
 		for (;;) {
 			nev = kevent(kq, &chlist, 1, &evlist, 1, NULL);
 			if (nev == -1) {
-				syslog(LOG_ERR, "kqueue error: unkown");
+				syslog(LOG_ERR, "Kqueue error while getting new kevent: unknown error.");
 				fclose(fp);
 				goto reopen;
 			} else if (nev > 0) {
@@ -753,7 +890,7 @@ reopen:
 				if (command != NULL)
 					system(command);
 				else {
-					load_dhcp(fp, leasefile, domain_sufix, now);
+					load_dhcp(fp, leasefile, domain_suffix, now);
 
 					write_status();
 					//syslog(LOG_INFO, "written temp hosts file after modification event.");
